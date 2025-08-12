@@ -43,7 +43,7 @@ LABELS_PATH = "app/models/label_map.json"
 ALLOWED_EXT = (".jpg", ".jpeg", ".png", ".bmp")  # tuple for endswith
 
 # Runtime knobs
-YAW_TH, PITCH_TH = 15.0, 15.0
+YAW_TH, PITCH_TH = 30.0, 30.0  # More lenient thresholds for better recognition
 PROC_W = 320
 
 app = Flask(__name__)
@@ -192,10 +192,15 @@ def process_and_emit(frame):
     yaw = pitch = None
 
     yaw, pitch, _ = head_pose_angles(roi_small, pts5_small)
+    
+    # Debug: Show the detected angles
+    if yaw is not None and pitch is not None:
+        print(f"Debug: Yaw: {yaw:.1f}°, Pitch: {pitch:.1f}° (thresholds: ±{YAW_TH}°, ±{PITCH_TH}°)")
+    
     if yaw is not None and abs(yaw) <= YAW_TH and abs(pitch) <= PITCH_TH:
         aligned = align_face(roi_small, pts5_small, out_size=100)
         pred_id, conf = recognizer.predict(aligned)
-        if conf < 60:
+        if conf < 80:  # LBPH: lower values are better, so increase threshold
             name = inv_labels.get(pred_id, "Unknown")
             name_txt = f"{name} ({conf:.1f})"
             color = (0, 255, 0)
