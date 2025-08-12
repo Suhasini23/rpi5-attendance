@@ -1,4 +1,3 @@
-# app/runtime.py
 import os, json, time, sqlite3, re
 import numpy as np
 import cv2
@@ -110,48 +109,56 @@ def gen_frames():
     return gen_frames_opencv()
 
 def gen_frames_picamera2():
-    """Picamera2 path with correct colors:
-    - Capture in RGB888 (what Picamera2 actually returns via capture_array)
-    - Convert to BGR for OpenCV drawing/JPEG to avoid purple tint
-    - AWB/AE left enabled; optional 50 Hz anti-flicker
+    """Picamera2 path with correct colors on Pi5 industrial shield:
+    - Request uncompressed RAW (SGRBG10) to avoid purple/blacked-out shadows:contentReference[oaicite:2]{index=2}.
+    - Capture in RGB888 and convert to BGR for OpenCV/JPEG:contentReference[oaicite:3]{index=3}.
+    - Leave AWB/AE enabled.
     """
     picam2 = None
     try:
         from picamera2 import Picamera2
+        # Some features (Transform) live in libcamera; import only if available
+        try:
+            from libcamera import Transform
+        except Exception:
+            Transform = None
+
         picam2 = Picamera2()
 
+        # Configure preview or video stream; request uncompressed raw to avoid colour artefacts
         cfg = picam2.create_preview_configuration(
-            main={"size": (640, 480), "format": "RGB888"}  # request RGB explicitly
+            main={"size": (640, 480), "format": "RGB888"},
+            raw={'format': 'SGRBG10'}  # uncompressed to avoid Pi5/v1 compression bug
         )
         picam2.configure(cfg)
 
-        # Keep auto exposure/white-balance running
+        # Keep auto exposure/white-balance running; don't lock gains
         try:
             picam2.set_controls({
                 "AeEnable": True,
                 "AwbEnable": True,
-                "AwbMode": 0,        # 0 = Auto
-                "AeFlickerMode": 1,  # 1 = 50 Hz (ignore if unsupported)
+                "AwbMode": 0,        # Auto
+                "AeFlickerMode": 1,  # 50Hz anti-flicker (optional)
             })
         except Exception as e:
             print(f"[Camera] Some controls not applied: {e}")
 
         picam2.start()
-        print("[Camera] Picamera2 started (RGB888 -> BGR)")
+        print("[Camera] Picamera2 started (RGB888→BGR, raw SGRBG10)")
         time.sleep(2.0)  # let AWB/AE settle
 
         while True:
-            frame = picam2.capture_array()  # RGB from Picamera2
+            # Capture an array; Picamera2 returns RGB frames even if you ask for BGR
+            frame = picam2.capture_array()
             if frame is None or frame.size == 0:
                 time.sleep(0.01)
                 continue
 
-            # Normalize channels: RGB -> BGR for OpenCV ops and JPEG encoder
+            # Convert to BGR for OpenCV: drop alpha if present, swap channels
             try:
                 if frame.ndim == 3:
-                    # Drop alpha if somehow present, then convert
                     if frame.shape[2] == 4:
-                        frame = frame[:, :, :3]
+                        frame = frame[:, :, :3]  # drop alpha
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             except Exception as e:
                 print(f"[Camera] Color convert error: {e}")
@@ -167,8 +174,8 @@ def gen_frames_picamera2():
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
-                b"\r\n" + chunk + b"\r\n"
+                b"Content-Length: " + str(len(chunk)).encode() + b"\r\n\r\n"
+                + chunk + b"\r\n"
             )
 
     except Exception as e:
@@ -216,8 +223,8 @@ def gen_frames_opencv():
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n"
-            b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
-            b"\r\n" + chunk + b"\r\n"
+            b"Content-Length: " + str(len(chunk)).encode() + b"\r\n\r\n"
+            + chunk + b"\r\n"
         )
 
 # ----------------- Vision pipeline -----------------
