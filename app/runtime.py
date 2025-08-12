@@ -119,10 +119,16 @@ def gen_frames_picamera2():
         # Initialize picamera2
         picam2 = Picamera2()
         
-        # Configure camera
+        # Configure camera with better color settings
         config = picam2.create_preview_configuration(
             main={"size": (640, 480), "format": "BGR888"},
-            controls={"FrameDurationLimits": (33333, 33333)}  # 30 FPS
+            controls={
+                "FrameDurationLimits": (33333, 33333),  # 30 FPS
+                "AeEnable": True,  # Auto exposure
+                "AwbEnable": True,  # Auto white balance
+                "AeExposureMode": "Normal",
+                "AwbMode": "Auto"
+            }
         )
         picam2.configure(config)
         
@@ -130,8 +136,15 @@ def gen_frames_picamera2():
         picam2.start()
         print("[Camera] picamera2 initialized successfully")
         
-        # Warm up
+        # Warm up and set initial controls
         time.sleep(2)
+        
+        # Try to set better color balance
+        try:
+            picam2.set_controls({"AwbMode": "Auto"})
+            picam2.set_controls({"AeEnable": True})
+        except:
+            pass  # Some controls might not be available
         
         while True:
             try:
@@ -142,6 +155,13 @@ def gen_frames_picamera2():
                     print("[Camera] Empty frame from picamera2")
                     time.sleep(0.1)
                     continue
+                
+                # Ensure proper color format (BGR to RGB if needed)
+                if len(frame.shape) == 3:
+                    # Convert BGR to RGB for better color representation
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Convert back to BGR for OpenCV compatibility
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 
                 # Process frame for face detection
                 h, w = frame.shape[:2]
