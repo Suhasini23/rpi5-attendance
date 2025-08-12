@@ -9,6 +9,8 @@ from queue import Queue
 from threading import Lock
 from flask import Flask, Response, jsonify, request, stream_with_context
 from werkzeug.utils import secure_filename
+from utils.align import align_face
+from utils.pose import head_pose_angles
 
 """
 This runtime module starts a Flask web application that serves video frames,
