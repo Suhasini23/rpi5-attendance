@@ -111,61 +111,77 @@ def gen_frames():
 
 def gen_frames_picamera2():
     """Generate frames using Picamera2 (CSI camera on Pi 5)."""
-    picam2 = Picamera2()
-
-    # Use RGB; we'll convert once to BGR for OpenCV (prevents blue tint).
-    config = picam2.create_preview_configuration(
-        main={"size": (640, 480), "format": "RGB888"}
-    )
-    picam2.configure(config)
-
-    # Set better color controls to fix the bluish tint
+    picam2 = None
     try:
-        picam2.set_controls({
-            "AwbEnable": True,
-            "AeEnable": True,
-            "AwbMode": 0,  # 0=Auto white balance
-            "AeExposureMode": 0,  # 0=Normal exposure
-            "AeMeteringMode": 0,  # 0=Centre weighted
-        })
-    except Exception:
-        pass
+        picam2 = Picamera2()
 
-    picam2.start()
-    print("[Camera] Picamera2 started (RGB888)")
-    time.sleep(3)  # longer warm-up for AWB/AE to settle
-
-    while True:
-        # Capture RGB frame, convert ONCE to BGR for OpenCV
-        frame_rgb = picam2.capture_array()
-        if frame_rgb is None or frame_rgb.size == 0:
-            time.sleep(0.01)
-            continue
-            
-        # Fix color balance - convert RGB to BGR with proper color correction
-        frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        
-        # Apply color correction to reduce bluish tint
-        # Increase red and green channels slightly
-        frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
-        
-        # Apply slight color temperature adjustment
-        frame = cv2.applyColorMap(frame, cv2.COLORMAP_WARM)
-
-        # ---- detection + overlay ----
-        process_and_emit(frame)
-
-        # JPEG encode + MJPEG chunk
-        ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ret:
-            continue
-        chunk = buf.tobytes()
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n"
-            b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
-            b"\r\n" + chunk + b"\r\n"
+        # Use RGB; we'll convert once to BGR for OpenCV (prevents blue tint).
+        config = picam2.create_preview_configuration(
+            main={"size": (640, 480), "format": "RGB888"}
         )
+        picam2.configure(config)
+
+        # Set better color controls to fix the bluish tint
+        try:
+            picam2.set_controls({
+                "AwbEnable": True,
+                "AeEnable": True,
+                "AwbMode": 0,  # 0=Auto white balance
+                "AeExposureMode": 0,  # 0=Normal exposure
+                "AeMeteringMode": 0,  # 0=Centre weighted
+            })
+        except Exception:
+            pass
+
+        picam2.start()
+        print("[Camera] Picamera2 started (RGB888)")
+        time.sleep(3)  # longer warm-up for AWB/AE to settle
+
+        while True:
+            # Capture RGB frame, convert ONCE to BGR for OpenCV
+            frame_rgb = picam2.capture_array()
+            if frame_rgb is None or frame_rgb.size == 0:
+                time.sleep(0.01)
+                continue
+                
+            # Fix color balance - convert RGB to BGR with proper color correction
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            
+            # Apply color correction to reduce bluish tint
+            # Increase red and green channels slightly to reduce blue dominance
+            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
+            
+            # Simple color temperature adjustment (increase red, reduce blue)
+            b, g, r = cv2.split(frame)
+            r = cv2.add(r, 10)  # Increase red channel
+            b = cv2.subtract(b, 5)  # Reduce blue channel
+            frame = cv2.merge([b, g, r])
+
+            # ---- detection + overlay ----
+            process_and_emit(frame)
+
+            # JPEG encode + MJPEG chunk
+            ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ret:
+                continue
+            chunk = buf.tobytes()
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
+                b"\r\n" + chunk + b"\r\n"
+            )
+    except Exception as e:
+        print(f"[Camera] Picamera2 error: {e}")
+        raise e
+    finally:
+        # Clean up camera resources
+        if picam2:
+            try:
+                picam2.stop()
+                picam2.close()
+            except:
+                pass
 
 def gen_frames_opencv():
     """Fallback using OpenCV V4L2 (for USB UVC cameras)."""
