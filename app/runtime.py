@@ -147,15 +147,19 @@ def gen_frames_picamera2():
             # Fix color balance - convert RGB to BGR with proper color correction
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             
-            # Apply color correction to reduce bluish tint
-            # Increase red and green channels slightly to reduce blue dominance
-            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
+            # Apply aggressive color correction to eliminate bluish tint
+            # Increase brightness and contrast first
+            frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=20)
             
-            # Simple color temperature adjustment (increase red, reduce blue)
+            # Strong color temperature adjustment to eliminate blue/purple cast
             b, g, r = cv2.split(frame)
-            r = cv2.add(r, 10)  # Increase red channel
-            b = cv2.subtract(b, 5)  # Reduce blue channel
+            r = cv2.add(r, 30)  # Significantly increase red channel
+            g = cv2.add(g, 15)  # Increase green channel
+            b = cv2.subtract(b, 25)  # Significantly reduce blue channel
             frame = cv2.merge([b, g, r])
+            
+            # Apply additional color correction to warm up the image
+            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=0)
 
             # ---- detection + overlay ----
             process_and_emit(frame)
