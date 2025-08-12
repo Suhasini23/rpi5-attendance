@@ -246,7 +246,7 @@ def _save_uploaded_images(person_name: str, files):
         saved.append(out_path)
     return saved
 
-def _detect_align_for_training(det_local: Any, img_bgr):
+def _detect_align_for_training(det_local: any, img_bgr):
     dets = det_local.detect(img_bgr)
     if not dets:
         return None
