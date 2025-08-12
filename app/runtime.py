@@ -111,43 +111,55 @@ def gen_frames():
 
 def gen_frames_picamera2():
     """Picamera2 path with correct colors:
-    - Capture in BGR888 (OpenCV-native)
-    - AWB stays enabled (no ColourGains lock)
-    - Optional 50 Hz anti-flicker
+    - Capture in RGB888 (what Picamera2 actually returns via capture_array)
+    - Convert to BGR for OpenCV drawing/JPEG to avoid purple tint
+    - AWB/AE left enabled; optional 50 Hz anti-flicker
     """
     picam2 = None
     try:
+        from picamera2 import Picamera2
         picam2 = Picamera2()
 
         cfg = picam2.create_preview_configuration(
-            main={"size": (640, 480), "format": "BGR888"}
+            main={"size": (640, 480), "format": "RGB888"}  # request RGB explicitly
         )
         picam2.configure(cfg)
 
-        # Keep auto exposure/white-balance running; don't lock gains.
+        # Keep auto exposure/white-balance running
         try:
             picam2.set_controls({
                 "AeEnable": True,
                 "AwbEnable": True,
-                "AwbMode": 0,        # 0=Auto
-                "AeFlickerMode": 1,  # 1=50Hz (safe to ignore if unsupported)
+                "AwbMode": 0,        # 0 = Auto
+                "AeFlickerMode": 1,  # 1 = 50 Hz (ignore if unsupported)
             })
         except Exception as e:
             print(f"[Camera] Some controls not applied: {e}")
 
         picam2.start()
-        print("[Camera] Picamera2 started (BGR888)")
+        print("[Camera] Picamera2 started (RGB888 -> BGR)")
         time.sleep(2.0)  # let AWB/AE settle
 
         while True:
-            frame = picam2.capture_array()  # already BGR
+            frame = picam2.capture_array()  # RGB from Picamera2
             if frame is None or frame.size == 0:
                 time.sleep(0.01)
                 continue
 
+            # Normalize channels: RGB -> BGR for OpenCV ops and JPEG encoder
+            try:
+                if frame.ndim == 3:
+                    # Drop alpha if somehow present, then convert
+                    if frame.shape[2] == 4:
+                        frame = frame[:, :, :3]
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                print(f"[Camera] Color convert error: {e}")
+
             # ---- detection + overlay ----
             process_and_emit(frame)
 
+            # MJPEG encode & yield
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if not ok:
                 continue
@@ -167,7 +179,7 @@ def gen_frames_picamera2():
             try:
                 picam2.stop()
                 picam2.close()
-            except:
+            except Exception:
                 pass
 
 def gen_frames_opencv():
