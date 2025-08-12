@@ -119,19 +119,21 @@ def gen_frames_picamera2():
     )
     picam2.configure(config)
 
-    # Optional: let AWB/AE settle to avoid color casts
+    # Set better color controls to fix the bluish tint
     try:
         picam2.set_controls({
             "AwbEnable": True,
             "AeEnable": True,
-            # "AwbMode": 0,  # 0=Auto; try 1/3 for incandescent/fluorescent if needed
+            "AwbMode": 0,  # 0=Auto white balance
+            "AeExposureMode": 0,  # 0=Normal exposure
+            "AeMeteringMode": 0,  # 0=Centre weighted
         })
     except Exception:
         pass
 
     picam2.start()
     print("[Camera] Picamera2 started (RGB888)")
-    time.sleep(2)  # warm-up for AWB/AE
+    time.sleep(3)  # longer warm-up for AWB/AE to settle
 
     while True:
         # Capture RGB frame, convert ONCE to BGR for OpenCV
@@ -139,7 +141,16 @@ def gen_frames_picamera2():
         if frame_rgb is None or frame_rgb.size == 0:
             time.sleep(0.01)
             continue
+            
+        # Fix color balance - convert RGB to BGR with proper color correction
         frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        
+        # Apply color correction to reduce bluish tint
+        # Increase red and green channels slightly
+        frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
+        
+        # Apply slight color temperature adjustment
+        frame = cv2.applyColorMap(frame, cv2.COLORMAP_WARM)
 
         # ---- detection + overlay ----
         process_and_emit(frame)
