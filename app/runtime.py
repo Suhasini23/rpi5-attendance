@@ -116,7 +116,8 @@ def gen_frames_picamera2():
         picam2 = Picamera2()
         
         # Try multiple formats to find the one that works best for colors
-        formats_to_try = ['RGB888', 'BGR888', 'XBGR8888']
+        # For Camera Module 3 (IMX708), prioritize formats that work well with Bayer sensors
+        formats_to_try = ['RGB888', 'BGR888', 'XBGR8888', 'YUV420']
         camera_format = None
         
         for format_type in formats_to_try:
@@ -127,6 +128,19 @@ def gen_frames_picamera2():
                 config = picam2.create_preview_configuration(
                     main={"size": (640, 480), "format": format_type}
                 )
+                
+                # For Camera Module 3, add specific optimizations
+                if format_type in ['RGB888', 'BGR888']:
+                    try:
+                        # Set better color controls for CM3
+                        config["controls"] = config.get("controls", {})
+                        config["controls"]["AwbEnable"] = True
+                        config["controls"]["AeEnable"] = True
+                        config["controls"]["AwbMode"] = 1  # Tungsten mode for warmer colors
+                        config["controls"]["AeExposureMode"] = 0  # Normal exposure
+                        print(f"[Camera] Added CM3-specific controls for {format_type}")
+                    except Exception as e:
+                        print(f"[Camera] Could not add CM3 controls: {e}")
                 
                 # Configure and start camera
                 picam2.configure(config)
@@ -189,35 +203,54 @@ def gen_frames_picamera2():
                 time.sleep(0.01)
                 continue
             
-            # Handle different formats with proper color conversion
+            # Handle different formats with proper color conversion for Camera Module 3
             if camera_format == 'RGB888':
-                # For RGB888, we need to handle the color conversion carefully
-                # The purple output suggests the conversion isn't working right
+                # Camera Module 3 outputs RGB frames that need careful conversion
+                # The IMX708 sensor can have color balance issues, so we need robust handling
                 try:
-                    # Try direct RGB to BGR conversion
+                    # Convert RGB to BGR for OpenCV
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                except:
-                    # If that fails, try manual channel swapping
-                    frame = frame[:, :, ::-1]  # Reverse channels: RGB -> BGR
-                
-                # Apply color correction to fix any remaining tint
+                    
+                    # Apply CM3-specific color correction
+                    # The IMX708 tends to have a slight blue/purple cast
+                    b, g, r = cv2.split(frame)
+                    
+                    # Boost red and green channels to compensate for blue dominance
+                    r = cv2.add(r, 25)  # Strong red boost for CM3
+                    g = cv2.add(g, 15)  # Moderate green boost
+                    b = cv2.subtract(b, 20)  # Reduce blue channel
+                    
+                    # Ensure values stay in valid range
+                    r = cv2.min(r, 255)
+                    g = cv2.min(g, 255)
+                    b = cv2.max(b, 0)
+                    
+                    frame = cv2.merge([b, g, r])
+                    
+                except Exception as e:
+                    print(f"[Camera] RGB conversion failed: {e}, trying manual method")
+                    # Fallback: manual channel reversal
+                    frame = frame[:, :, ::-1]
+                    
+            elif camera_format == 'BGR888':
+                # Already in BGR format, but CM3 might still need color correction
                 b, g, r = cv2.split(frame)
-                # Boost red and green, reduce blue to fix purple tint
                 r = cv2.add(r, 20)
                 g = cv2.add(g, 10)
                 b = cv2.subtract(b, 15)
                 frame = cv2.merge([b, g, r])
                 
-            elif camera_format == 'BGR888':
-                # Already in BGR format, no conversion needed
-                pass
+            elif camera_format == 'YUV420':
+                # Convert YUV to BGR for OpenCV
+                frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                
             elif camera_format == 'XBGR8888':
                 # Remove alpha channel if present
                 if len(frame.shape) == 3 and frame.shape[2] == 4:
                     frame = frame[:, :, :3]
             
-            # Apply minimal color correction if needed
-            frame = cv2.convertScaleAbs(frame, alpha=1.05, beta=3)
+            # Final color adjustment for CM3
+            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
             
             # ---- detection + overlay ----
             process_and_emit(frame)
