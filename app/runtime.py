@@ -98,9 +98,25 @@ deb = Debounce(cooldown_sec=120)
 
 # ----------------- Video loop (MJPEG producer) -----------------
 def gen_frames():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Camera not available")
+    # Try different camera devices - modern Pi models often use different device numbers
+    camera_devices = [0, 1, 2, 3, 4, 5, 6, 7, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+    
+    cap = None
+    for device in camera_devices:
+        try:
+            cap = cv2.VideoCapture(device)
+            if cap.isOpened():
+                print(f"[Camera] Successfully opened camera device {device}")
+                break
+            else:
+                cap.release()
+        except Exception as e:
+            print(f"[Camera] Failed to open device {device}: {e}")
+            if cap:
+                cap.release()
+    
+    if not cap or not cap.isOpened():
+        raise RuntimeError("No camera available on any device")
 
     while True:
         ok, frame = cap.read()
@@ -305,6 +321,23 @@ def logs():
 def latest_detection():
     with latest_lock:
         return jsonify(latest)
+
+@app.route("/test-camera")
+def test_camera():
+    """Simple endpoint to test if camera is accessible"""
+    try:
+        cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                return jsonify({"status": "success", "message": "Camera is working", "frame_shape": frame.shape})
+            else:
+                return jsonify({"status": "error", "message": "Camera opened but couldn't read frame"}), 500
+        else:
+            return jsonify({"status": "error", "message": "Camera device 0 not accessible"}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Camera error: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, threaded=True)
