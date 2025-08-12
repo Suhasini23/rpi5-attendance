@@ -115,78 +115,40 @@ def gen_frames_picamera2():
     try:
         picam2 = Picamera2()
 
-        # Use RGB; we'll convert once to BGR for OpenCV (prevents blue tint).
+        # Use RGB888 format - this gets reds and blues the right way round for OpenCV
         config = picam2.create_preview_configuration(
             main={"size": (640, 480), "format": "RGB888"}
         )
         picam2.configure(config)
 
-        # Improved color controls to fix the bluish tint
+        # Simple color controls - let the RGB888 format handle the color correction
         try:
             picam2.set_controls({
                 "AwbEnable": True,
                 "AeEnable": True,
-                "AwbMode": 1,  # Try mode 1 (tungsten) instead of 0 (auto)
-                "AeExposureMode": 0,  # 0=Normal exposure
-                "AeMeteringMode": 0,  # 0=Centre weighted
-                "ColourGains": (1.4, 1.8),  # (red_gain, blue_gain) - increase red, reduce blue
-                "Brightness": 0.1,  # Slight brightness boost
-                "Contrast": 1.2,    # Slight contrast boost
+                "AwbMode": 1,  # Tungsten mode for warmer colors
             })
         except Exception as e:
-            print(f"[Camera] Could not set advanced controls: {e}")
-            # Fallback to basic controls
-            try:
-                picam2.set_controls({
-                    "AwbEnable": True,
-                    "AwbMode": 1,  # Tungsten mode often fixes blue tint
-                })
-            except Exception:
-                pass
+            print(f"[Camera] Could not set controls: {e}")
 
         picam2.start()
-        print("[Camera] Picamera2 started (RGB888) with improved color correction")
-        time.sleep(3)  # longer warm-up for AWB/AE to settle
+        print("[Camera] Picamera2 started (RGB888) - should have correct colors")
+        time.sleep(2)  # warm-up for AWB
 
         while True:
-            # Capture RGB frame, convert ONCE to BGR for OpenCV
+            # Capture RGB frame - the RGB888 format should give correct colors
             frame_rgb = picam2.capture_array()
             if frame_rgb is None or frame_rgb.size == 0:
                 time.sleep(0.01)
                 continue
                 
-            # Convert RGB to BGR for OpenCV
+            # Convert RGB to BGR for OpenCV - this should preserve correct colors
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             
-            # More refined color correction approach
-            # Method 1: LAB color space correction (often most effective)
-            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
+            # No complex color correction needed - the RGB888 format handles it
+            # Just ensure proper brightness/contrast
+            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
             
-            # Adjust the 'a' and 'b' channels to reduce blue/purple cast
-            # 'a' channel: green-red axis, 'b' channel: blue-yellow axis
-            a = cv2.add(a, 8)   # Shift slightly toward red
-            b = cv2.subtract(b, 12)  # Shift toward yellow (away from blue)
-            
-            lab_corrected = cv2.merge([l, a, b])
-            frame = cv2.cvtColor(lab_corrected, cv2.COLOR_LAB2BGR)
-            
-            # Method 2: Additional RGB channel adjustment (lighter touch)
-            b_channel, g_channel, r_channel = cv2.split(frame)
-            
-            # More subtle channel adjustments
-            r_channel = cv2.add(r_channel, 15)  # Boost red slightly
-            g_channel = cv2.add(g_channel, 5)   # Slight green boost
-            b_channel = cv2.subtract(b_channel, 10)  # Reduce blue slightly
-            
-            frame = cv2.merge([b_channel, g_channel, r_channel])
-            
-            # Method 3: Gamma correction for better color balance
-            gamma = 1.1  # Slight gamma adjustment
-            inv_gamma = 1.0 / gamma
-            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-            frame = cv2.LUT(frame, table)
-
             # ---- detection + overlay ----
             process_and_emit(frame)
 
