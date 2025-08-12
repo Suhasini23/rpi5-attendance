@@ -112,8 +112,8 @@ def gen_frames():
 def gen_frames_picamera2():
     """Picamera2 path with correct colors:
     - Capture in BGR888 (OpenCV-native)
-    - No cvtColor / no post color tweaks
-    - Let AWB settle; optionally lock gains
+    - AWB stays enabled (no ColourGains lock)
+    - Optional 50 Hz anti-flicker
     """
     picam2 = None
     try:
@@ -124,12 +124,13 @@ def gen_frames_picamera2():
         )
         picam2.configure(cfg)
 
-        # Enable AE/AWB; set 50Hz flicker (India) if supported
+        # Keep auto exposure/white-balance running; don't lock gains.
         try:
             picam2.set_controls({
                 "AeEnable": True,
                 "AwbEnable": True,
-                "AeFlickerMode": 1,  # 0=Off, 1=50Hz, 2=60Hz (mapping may vary; safe to ignore if not supported)
+                "AwbMode": 0,        # 0=Auto
+                "AeFlickerMode": 1,  # 1=50Hz (safe to ignore if unsupported)
             })
         except Exception as e:
             print(f"[Camera] Some controls not applied: {e}")
@@ -137,17 +138,6 @@ def gen_frames_picamera2():
         picam2.start()
         print("[Camera] Picamera2 started (BGR888)")
         time.sleep(2.0)  # let AWB/AE settle
-
-        # OPTIONAL: lock slightly tweaked gains if your room is consistently cool
-        try:
-            md = picam2.capture_metadata() or {}
-            r0, b0 = md.get("ColourGains", (1.0, 1.0))
-            r_gain = max(0.5, min(r0 * 1.10, 3.0))  # +10% red
-            b_gain = max(0.5, min(b0 * 0.95, 3.0))  # -5% blue
-            picam2.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
-            print(f"[WB] Locked ColourGains: R={r_gain:.2f}, B={b_gain:.2f}")
-        except Exception:
-            pass  # optional; skip if unsupported
 
         while True:
             frame = picam2.capture_array()  # already BGR
@@ -158,7 +148,6 @@ def gen_frames_picamera2():
             # ---- detection + overlay ----
             process_and_emit(frame)
 
-            # MJPEG chunk
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if not ok:
                 continue
@@ -408,36 +397,6 @@ def logs():
 def latest_detection():
     with latest_lock:
         return jsonify(latest)
-
-@app.route("/test-camera")
-def test_camera():
-    out = {"picamera2_available": PICAMERA2_AVAILABLE, "working_devices": []}
-    try:
-        if PICAMERA2_AVAILABLE:
-            picam2 = Picamera2()
-            cfg = picam2.create_preview_configuration(main={"size": (640, 480), "format": "BGR888"})
-            picam2.configure(cfg); picam2.start(); time.sleep(1)
-            arr = picam2.capture_array()
-            md = picam2.capture_metadata() or {}
-            gains = md.get("ColourGains", (None, None))
-            model = getattr(picam2, "camera_properties", {}).get("Model", "unknown")
-            picam2.stop()
-            out["picamera2_test"] = "ok" if arr is not None and arr.size > 0 else "no_frame"
-            out["picamera2_info"] = {"frame_shape": arr.shape if arr is not None else None,
-                                     "model": model, "colour_gains": gains}
-        # Probe a few V4L2 devices
-        for i in range(0, 6):
-            cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
-            if cap.isOpened():
-                ok, frame = cap.read()
-                if ok and frame is not None and frame.size > 0:
-                    out["working_devices"].append({"idx": i, "shape": frame.shape})
-            cap.release()
-        out["status"] = "ok" if (out.get("picamera2_test") == "ok" or out["working_devices"]) else "err"
-        return jsonify(out)
-    except Exception as e:
-        out["status"] = "err"; out["error"] = str(e)
-        return jsonify(out), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, threaded=True)
