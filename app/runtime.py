@@ -110,44 +110,99 @@ def gen_frames():
     return gen_frames_opencv()
 
 def gen_frames_picamera2():
-    """Generate frames using Picamera2 (CSI camera on Pi 5) with improved color correction."""
+    """Generate frames using Picamera2 (CSI camera on Pi 5) with proven color handling."""
     picam2 = None
     try:
         picam2 = Picamera2()
-
-        # Use RGB888 format - this gets reds and blues the right way round for OpenCV
-        config = picam2.create_preview_configuration(
-            main={"size": (640, 480), "format": "RGB888"}
-        )
-        picam2.configure(config)
-
-        # Simple color controls - let the RGB888 format handle the color correction
+        
+        # Try multiple formats to find the one that works best for colors
+        formats_to_try = ['RGB888', 'BGR888', 'XBGR8888']
+        camera_format = None
+        
+        for format_type in formats_to_try:
+            try:
+                print(f"[Camera] Trying format: {format_type}")
+                
+                # Create configuration with current format
+                config = picam2.create_preview_configuration(
+                    main={"size": (640, 480), "format": format_type}
+                )
+                
+                # Configure and start camera
+                picam2.configure(config)
+                picam2.start()
+                
+                # Test frame capture
+                test_frame = picam2.capture_array()
+                if test_frame is not None and test_frame.size > 0:
+                    print(f"[Camera] ✅ Format {format_type} works - Frame shape: {test_frame.shape}")
+                    camera_format = format_type
+                    break
+                else:
+                    print(f"[Camera] ❌ Format {format_type} failed - invalid frame")
+                    picam2.stop()
+                    continue
+                    
+            except Exception as e:
+                print(f"[Camera] ❌ Format {format_type} failed: {e}")
+                try:
+                    picam2.stop()
+                except:
+                    pass
+                continue
+        
+        if not camera_format:
+            print("[Camera] ❌ All formats failed, using fallback")
+            camera_format = 'RGB888'
+            config = picam2.create_preview_configuration(
+                main={"size": (640, 480), "format": camera_format}
+            )
+            picam2.configure(config)
+            picam2.start()
+        
+        # Set color controls based on the working format
         try:
-            picam2.set_controls({
-                "AwbEnable": True,
-                "AeEnable": True,
-                "AwbMode": 1,  # Tungsten mode for warmer colors
-            })
+            if camera_format == 'RGB888':
+                # For RGB888, use tungsten mode to warm up colors
+                picam2.set_controls({
+                    "AwbEnable": True,
+                    "AeEnable": True,
+                    "AwbMode": 1,  # Tungsten mode for warmer colors
+                })
+            elif camera_format == 'BGR888':
+                # For BGR888, use auto mode
+                picam2.set_controls({
+                    "AwbEnable": True,
+                    "AeEnable": True,
+                    "AwbMode": 0,  # Auto mode
+                })
         except Exception as e:
             print(f"[Camera] Could not set controls: {e}")
-
-        picam2.start()
-        print("[Camera] Picamera2 started (RGB888) - should have correct colors")
+        
+        print(f"[Camera] Picamera2 started with format: {camera_format}")
         time.sleep(2)  # warm-up for AWB
-
+        
         while True:
-            # Capture RGB frame - the RGB888 format should give correct colors
-            frame_rgb = picam2.capture_array()
-            if frame_rgb is None or frame_rgb.size == 0:
+            # Capture frame
+            frame = picam2.capture_array()
+            if frame is None or frame.size == 0:
                 time.sleep(0.01)
                 continue
-                
-            # Convert RGB to BGR for OpenCV - this should preserve correct colors
-            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             
-            # No complex color correction needed - the RGB888 format handles it
-            # Just ensure proper brightness/contrast
-            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
+            # Handle different formats with proper color conversion
+            if camera_format == 'RGB888':
+                # Convert RGB to BGR for OpenCV - this preserves correct colors
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            elif camera_format == 'BGR888':
+                # Already in BGR format, no conversion needed
+                pass
+            elif camera_format == 'XBGR8888':
+                # Remove alpha channel if present
+                if len(frame.shape) == 3 and frame.shape[2] == 4:
+                    frame = frame[:, :, :3]
+            
+            # Apply minimal color correction if needed
+            frame = cv2.convertScaleAbs(frame, alpha=1.05, beta=3)
             
             # ---- detection + overlay ----
             process_and_emit(frame)
@@ -163,6 +218,7 @@ def gen_frames_picamera2():
                 b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
                 b"\r\n" + chunk + b"\r\n"
             )
+            
     except Exception as e:
         print(f"[Camera] Picamera2 error: {e}")
         raise e
