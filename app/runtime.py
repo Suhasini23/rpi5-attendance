@@ -119,16 +119,9 @@ def gen_frames_picamera2():
         # Initialize picamera2
         picam2 = Picamera2()
         
-        # Configure camera with better color settings
+        # Use simple configuration without complex controls
         config = picam2.create_preview_configuration(
-            main={"size": (640, 480), "format": "BGR888"},
-            controls={
-                "FrameDurationLimits": (33333, 33333),  # 30 FPS
-                "AeEnable": 1,  # Auto exposure (1 = True, 0 = False)
-                "AwbEnable": 1,  # Auto white balance (1 = True, 0 = False)
-                "AeExposureMode": 0,  # Normal exposure mode
-                "AwbMode": 0  # Auto white balance mode
-            }
+            main={"size": (640, 480), "format": "BGR888"}
         )
         picam2.configure(config)
         
@@ -136,15 +129,8 @@ def gen_frames_picamera2():
         picam2.start()
         print("[Camera] picamera2 initialized successfully")
         
-        # Warm up and set initial controls
+        # Warm up
         time.sleep(2)
-        
-        # Try to set better color balance
-        try:
-            picam2.set_controls({"AwbMode": 0})
-            picam2.set_controls({"AeEnable": 1})
-        except:
-            pass  # Some controls might not be available
         
         while True:
             try:
