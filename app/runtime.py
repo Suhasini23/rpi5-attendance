@@ -110,154 +110,57 @@ def gen_frames():
     return gen_frames_opencv()
 
 def gen_frames_picamera2():
-    """Generate frames using Picamera2 (CSI camera on Pi 5) with proven color handling."""
+    """Picamera2 path with correct colors:
+    - Capture in BGR888 (OpenCV-native)
+    - No cvtColor / no post color tweaks
+    - Let AWB settle; optionally lock gains
+    """
     picam2 = None
     try:
         picam2 = Picamera2()
-        
-        # Try multiple formats to find the one that works best for colors
-        # For Camera Module 3 (IMX708), prioritize formats that work well with Bayer sensors
-        formats_to_try = ['RGB888', 'BGR888', 'XBGR8888', 'YUV420']
-        camera_format = None
-        
-        for format_type in formats_to_try:
-            try:
-                print(f"[Camera] Trying format: {format_type}")
-                
-                # Create configuration with current format
-                config = picam2.create_preview_configuration(
-                    main={"size": (640, 480), "format": format_type}
-                )
-                
-                # For Camera Module 3, add specific optimizations
-                if format_type in ['RGB888', 'BGR888']:
-                    try:
-                        # Set better color controls for CM3
-                        config["controls"] = config.get("controls", {})
-                        config["controls"]["AwbEnable"] = True
-                        config["controls"]["AeEnable"] = True
-                        config["controls"]["AwbMode"] = 1  # Tungsten mode for warmer colors
-                        config["controls"]["AeExposureMode"] = 0  # Normal exposure
-                        print(f"[Camera] Added CM3-specific controls for {format_type}")
-                    except Exception as e:
-                        print(f"[Camera] Could not add CM3 controls: {e}")
-                
-                # Configure and start camera
-                picam2.configure(config)
-                picam2.start()
-                
-                # Test frame capture
-                test_frame = picam2.capture_array()
-                if test_frame is not None and test_frame.size > 0:
-                    print(f"[Camera] ✅ Format {format_type} works - Frame shape: {test_frame.shape}")
-                    camera_format = format_type
-                    break
-                else:
-                    print(f"[Camera] ❌ Format {format_type} failed - invalid frame")
-                    picam2.stop()
-                    continue
-                    
-            except Exception as e:
-                print(f"[Camera] ❌ Format {format_type} failed: {e}")
-                try:
-                    picam2.stop()
-                except:
-                    pass
-                continue
-        
-        if not camera_format:
-            print("[Camera] ❌ All formats failed, using fallback")
-            camera_format = 'RGB888'
-            config = picam2.create_preview_configuration(
-                main={"size": (640, 480), "format": camera_format}
-            )
-            picam2.configure(config)
-            picam2.start()
-        
-        # Set color controls based on the working format
+
+        cfg = picam2.create_preview_configuration(
+            main={"size": (640, 480), "format": "BGR888"}
+        )
+        picam2.configure(cfg)
+
+        # Enable AE/AWB; set 50Hz flicker (India) if supported
         try:
-            if camera_format == 'RGB888':
-                # For RGB888, use tungsten mode to warm up colors
-                picam2.set_controls({
-                    "AwbEnable": True,
-                    "AeEnable": True,
-                    "AwbMode": 1,  # Tungsten mode for warmer colors
-                })
-            elif camera_format == 'BGR888':
-                # For BGR888, use auto mode
-                picam2.set_controls({
-                    "AwbEnable": True,
-                    "AeEnable": True,
-                    "AwbMode": 0,  # Auto mode
-                })
+            picam2.set_controls({
+                "AeEnable": True,
+                "AwbEnable": True,
+                "AeFlickerMode": 1,  # 0=Off, 1=50Hz, 2=60Hz (mapping may vary; safe to ignore if not supported)
+            })
         except Exception as e:
-            print(f"[Camera] Could not set controls: {e}")
-        
-        print(f"[Camera] Picamera2 started with format: {camera_format}")
-        time.sleep(2)  # warm-up for AWB
-        
+            print(f"[Camera] Some controls not applied: {e}")
+
+        picam2.start()
+        print("[Camera] Picamera2 started (BGR888)")
+        time.sleep(2.0)  # let AWB/AE settle
+
+        # OPTIONAL: lock slightly tweaked gains if your room is consistently cool
+        try:
+            md = picam2.capture_metadata() or {}
+            r0, b0 = md.get("ColourGains", (1.0, 1.0))
+            r_gain = max(0.5, min(r0 * 1.10, 3.0))  # +10% red
+            b_gain = max(0.5, min(b0 * 0.95, 3.0))  # -5% blue
+            picam2.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
+            print(f"[WB] Locked ColourGains: R={r_gain:.2f}, B={b_gain:.2f}")
+        except Exception:
+            pass  # optional; skip if unsupported
+
         while True:
-            # Capture frame
-            frame = picam2.capture_array()
+            frame = picam2.capture_array()  # already BGR
             if frame is None or frame.size == 0:
                 time.sleep(0.01)
                 continue
-            
-            # Handle different formats with proper color conversion for Camera Module 3
-            if camera_format == 'RGB888':
-                # Camera Module 3 outputs RGB frames that need careful conversion
-                # The IMX708 sensor can have color balance issues, so we need robust handling
-                try:
-                    # Convert RGB to BGR for OpenCV
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    
-                    # Apply CM3-specific color correction
-                    # The IMX708 tends to have a slight blue/purple cast
-                    b, g, r = cv2.split(frame)
-                    
-                    # Boost red and green channels to compensate for blue dominance
-                    r = cv2.add(r, 25)  # Strong red boost for CM3
-                    g = cv2.add(g, 15)  # Moderate green boost
-                    b = cv2.subtract(b, 20)  # Reduce blue channel
-                    
-                    # Ensure values stay in valid range
-                    r = cv2.min(r, 255)
-                    g = cv2.min(g, 255)
-                    b = cv2.max(b, 0)
-                    
-                    frame = cv2.merge([b, g, r])
-                    
-                except Exception as e:
-                    print(f"[Camera] RGB conversion failed: {e}, trying manual method")
-                    # Fallback: manual channel reversal
-                    frame = frame[:, :, ::-1]
-                    
-            elif camera_format == 'BGR888':
-                # Already in BGR format, but CM3 might still need color correction
-                b, g, r = cv2.split(frame)
-                r = cv2.add(r, 20)
-                g = cv2.add(g, 10)
-                b = cv2.subtract(b, 15)
-                frame = cv2.merge([b, g, r])
-                
-            elif camera_format == 'YUV420':
-                # Convert YUV to BGR for OpenCV
-                frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-                
-            elif camera_format == 'XBGR8888':
-                # Remove alpha channel if present
-                if len(frame.shape) == 3 and frame.shape[2] == 4:
-                    frame = frame[:, :, :3]
-            
-            # Final color adjustment for CM3
-            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
-            
+
             # ---- detection + overlay ----
             process_and_emit(frame)
 
-            # JPEG encode + MJPEG chunk
-            ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if not ret:
+            # MJPEG chunk
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
                 continue
             chunk = buf.tobytes()
             yield (
@@ -266,19 +169,17 @@ def gen_frames_picamera2():
                 b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
                 b"\r\n" + chunk + b"\r\n"
             )
-            
+
     except Exception as e:
         print(f"[Camera] Picamera2 error: {e}")
-        raise e
+        raise
     finally:
-        # Clean up camera resources
         if picam2:
             try:
                 picam2.stop()
                 picam2.close()
             except:
                 pass
-
 
 def gen_frames_opencv():
     """Fallback using OpenCV V4L2 (for USB UVC cameras)."""
@@ -306,7 +207,7 @@ def gen_frames_opencv():
         # ---- detection + overlay ----
         process_and_emit(frame)
 
-        # JPEG encode + MJPEG chunk
+        # MJPEG chunk
         ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if not ret:
             continue
@@ -318,6 +219,7 @@ def gen_frames_opencv():
             b"\r\n" + chunk + b"\r\n"
         )
 
+# ----------------- Vision pipeline -----------------
 def process_and_emit(frame):
     """Run detection/recognition on the frame in-place and emit SSE events."""
     h, w = frame.shape[:2]
@@ -513,11 +415,17 @@ def test_camera():
     try:
         if PICAMERA2_AVAILABLE:
             picam2 = Picamera2()
-            cfg = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+            cfg = picam2.create_preview_configuration(main={"size": (640, 480), "format": "BGR888"})
             picam2.configure(cfg); picam2.start(); time.sleep(1)
             arr = picam2.capture_array()
+            md = picam2.capture_metadata() or {}
+            gains = md.get("ColourGains", (None, None))
+            model = getattr(picam2, "camera_properties", {}).get("Model", "unknown")
             picam2.stop()
             out["picamera2_test"] = "ok" if arr is not None and arr.size > 0 else "no_frame"
+            out["picamera2_info"] = {"frame_shape": arr.shape if arr is not None else None,
+                                     "model": model, "colour_gains": gains}
+        # Probe a few V4L2 devices
         for i in range(0, 6):
             cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
             if cap.isOpened():
