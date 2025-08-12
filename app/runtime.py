@@ -7,6 +7,16 @@ from threading import Lock
 from flask import Flask, Response, jsonify, request, stream_with_context
 from werkzeug.utils import secure_filename
 
+# Import picamera2 for better Pi camera support
+try:
+    from picamera2 import Picamera2
+    from picamera2.encoders import JpegEncoder
+    from picamera2.outputs import FileOutput
+    PICAMERA2_AVAILABLE = True
+except ImportError:
+    PICAMERA2_AVAILABLE = False
+    print("Warning: picamera2 not available, falling back to OpenCV")
+
 from utils.yunet import YuNet, ensure_model
 from utils.align import align_face
 from utils.pose import head_pose_angles
@@ -98,107 +108,263 @@ deb = Debounce(cooldown_sec=120)
 
 # ----------------- Video loop (MJPEG producer) -----------------
 def gen_frames():
+    if PICAMERA2_AVAILABLE:
+        return gen_frames_picamera2()
+    else:
+        return gen_frames_opencv()
+
+def gen_frames_picamera2():
+    """Generate frames using picamera2 (recommended for Pi)"""
+    try:
+        # Initialize picamera2
+        picam2 = Picamera2()
+        
+        # Configure camera
+        config = picam2.create_preview_configuration(
+            main={"size": (640, 480), "format": "BGR888"},
+            controls={"FrameDurationLimits": (33333, 33333)}  # 30 FPS
+        )
+        picam2.configure(config)
+        
+        # Start camera
+        picam2.start()
+        print("[Camera] picamera2 initialized successfully")
+        
+        # Warm up
+        time.sleep(2)
+        
+        while True:
+            try:
+                # Capture frame
+                frame = picam2.capture_array()
+                
+                if frame is None or frame.size == 0:
+                    print("[Camera] Empty frame from picamera2")
+                    time.sleep(0.1)
+                    continue
+                
+                # Process frame for face detection
+                h, w = frame.shape[:2]
+                scale = PROC_W / float(w)
+                small = cv2.resize(frame, (PROC_W, int(h * scale)))
+                
+                detections = det.detect(small)
+                if detections:
+                    detections.sort(key=lambda d: d[2], reverse=True)  # highest score
+                    (x, y, ww, hh), lmk, score = detections[0]
+
+                    # Map to original frame coords (for drawing)
+                    sx, sy = w / PROC_W, h / small.shape[0]
+                    X, Y, W, H = int(x * sx), int(y * sy), int(ww * sx), int(hh * sy)
+
+                    # Work on ROI (small) for alignment/pose
+                    roi_small = small[y:y+hh, x:x+ww].copy()
+                    pts5_small = [(int(px - x), int(py - y)) for (px, py) in lmk]
+
+                    name_txt = "Not frontal"
+                    color = (0, 0, 255)
+                    conf_val = None
+                    yaw = pitch = None
+
+                    # frontal-only gate via head pose
+                    yaw, pitch, roll = head_pose_angles(roi_small, pts5_small)
+                    if yaw is not None and abs(yaw) <= YAW_TH and abs(pitch) <= PITCH_TH:
+                        aligned = align_face(roi_small, pts5_small, out_size=100)
+                        pred_id, conf = recognizer.predict(aligned)
+                        conf_val = float(conf)
+                        if conf < 60:
+                            name = inv_labels.get(pred_id, "Unknown")
+                            name_txt = f"{name} ({conf:.1f})"
+                            color = (0, 255, 0)
+                            if deb.ok(name):
+                                log_attendance(name)
+                        else:
+                            name = "Unknown"
+                            name_txt = f"{name} ({conf:.1f})"
+                            color = (0, 0, 255)
+
+                        # emit detection event
+                        publish({
+                            "type": "detection",
+                            "name": name,
+                            "conf": conf_val,
+                            "yaw": float(yaw),
+                            "pitch": float(pitch),
+                            "box": {"x": X, "y": Y, "w": W, "h": H}
+                        })
+                    else:
+                        # non-frontal
+                        publish({
+                            "type": "detection",
+                            "name": "NotFrontal",
+                            "conf": None,
+                            "yaw": float(yaw) if yaw is not None else None,
+                            "pitch": float(pitch) if pitch is not None else None,
+                            "box": {"x": X, "y": Y, "w": W, "h": H}
+                        })
+
+                    # draw overlay
+                    cv2.rectangle(frame, (X, Y), (X+W, Y+H), color, 2)
+                    cv2.putText(frame, name_txt, (X, Y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # Encode JPEG
+                ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if not ret:
+                    print("[Camera] Failed to encode frame")
+                    continue
+                chunk = buf.tobytes()
+                
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
+                    b"\r\n" + chunk + b"\r\n"
+                )
+                
+            except Exception as e:
+                print(f"[Camera] Error in picamera2 loop: {e}")
+                time.sleep(0.1)
+                continue
+                
+    except Exception as e:
+        print(f"[Camera] Failed to initialize picamera2: {e}")
+        print("[Camera] Falling back to OpenCV method")
+        return gen_frames_opencv()
+
+def gen_frames_opencv():
+    """Fallback method using OpenCV (for compatibility)"""
     # Try different camera devices - modern Pi models often use different device numbers
     camera_devices = [0, 1, 2, 3, 4, 5, 6, 7, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
 
     cap = None
     for device in camera_devices:
-        cap = cv2.VideoCapture(device)
-        if cap.isOpened():
-            time.sleep(0.2)  # warm up
-            ok, _ = cap.read()
-            if ok:
-                print(f"[Camera] Using device {device}")
-                break
-            cap.release()
-            cap = None
-        else:
-            cap.release()
+        try:
+            print(f"[Camera] Trying OpenCV device {device}...")
+            cap = cv2.VideoCapture(device)
+            if cap.isOpened():
+                # Set camera properties for better compatibility
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                
+                time.sleep(0.5)  # warm up
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.size > 0:
+                    print(f"[Camera] Successfully opened OpenCV device {device}")
+                    print(f"[Camera] Frame size: {frame.shape}")
+                    break
+                else:
+                    print(f"[Camera] Device {device} opened but couldn't read frame")
+                    cap.release()
+                    cap = None
+            else:
+                print(f"[Camera] Device {device} not accessible")
+        except Exception as e:
+            print(f"[Camera] Error with device {device}: {e}")
+            if cap:
+                cap.release()
+                cap = None
 
     if not cap or not cap.isOpened():
-        raise RuntimeError("No camera available on any device")
+        error_msg = "No camera available on any device. Please check:"
+        error_msg += "\n1. Camera module is enabled in raspi-config"
+        error_msg += "\n2. User has video group permissions"
+        error_msg += "\n3. Camera is properly connected"
+        error_msg += "\n4. No other application is using the camera"
+        print(f"[Camera] {error_msg}")
+        raise RuntimeError(error_msg)
 
+    print(f"[Camera] Starting OpenCV video stream with device {device}")
+    
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        try:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print("[Camera] Failed to read frame, retrying...")
+                time.sleep(0.1)
+                continue
 
-        # downscale for detection speed
-        h, w = frame.shape[:2]
-        scale = PROC_W / float(w)
-        small = cv2.resize(frame, (PROC_W, int(h * scale)))
+            # downscale for detection speed
+            h, w = frame.shape[:2]
+            scale = PROC_W / float(w)
+            small = cv2.resize(frame, (PROC_W, int(h * scale)))
 
-        detections = det.detect(small)
-        if detections:
-            detections.sort(key=lambda d: d[2], reverse=True)  # highest score
-            (x, y, ww, hh), lmk, score = detections[0]
+            detections = det.detect(small)
+            if detections:
+                detections.sort(key=lambda d: d[2], reverse=True)  # highest score
+                (x, y, ww, hh), lmk, score = detections[0]
 
-            # Map to original frame coords (for drawing)
-            sx, sy = w / PROC_W, h / small.shape[0]
-            X, Y, W, H = int(x * sx), int(y * sy), int(ww * sx), int(hh * sy)
+                # Map to original frame coords (for drawing)
+                sx, sy = w / PROC_W, h / small.shape[0]
+                X, Y, W, H = int(x * sx), int(y * sy), int(ww * sx), int(hh * sy)
 
-            # Work on ROI (small) for alignment/pose
-            roi_small = small[y:y+hh, x:x+ww].copy()
-            pts5_small = [(int(px - x), int(py - y)) for (px, py) in lmk]
+                # Work on ROI (small) for alignment/pose
+                roi_small = small[y:y+hh, x:x+ww].copy()
+                pts5_small = [(int(px - x), int(py - y)) for (px, py) in lmk]
 
-            name_txt = "Not frontal"
-            color = (0, 0, 255)
-            conf_val = None
-            yaw = pitch = None
+                name_txt = "Not frontal"
+                color = (0, 0, 255)
+                conf_val = None
+                yaw = pitch = None
 
-            # frontal-only gate via head pose
-            yaw, pitch, roll = head_pose_angles(roi_small, pts5_small)
-            if yaw is not None and abs(yaw) <= YAW_TH and abs(pitch) <= PITCH_TH:
-                aligned = align_face(roi_small, pts5_small, out_size=100)
-                pred_id, conf = recognizer.predict(aligned)
-                conf_val = float(conf)
-                if conf < 60:
-                    name = inv_labels.get(pred_id, "Unknown")
-                    name_txt = f"{name} ({conf:.1f})"
-                    color = (0, 255, 0)
-                    if deb.ok(name):
-                        log_attendance(name)
+                # frontal-only gate via head pose
+                yaw, pitch, roll = head_pose_angles(roi_small, pts5_small)
+                if yaw is not None and abs(yaw) <= YAW_TH and abs(pitch) <= PITCH_TH:
+                    aligned = align_face(roi_small, pts5_small, out_size=100)
+                    pred_id, conf = recognizer.predict(aligned)
+                    conf_val = float(conf)
+                    if conf < 60:
+                        name = inv_labels.get(pred_id, "Unknown")
+                        name_txt = f"{name} ({conf:.1f})"
+                        color = (0, 255, 0)
+                        if deb.ok(name):
+                            log_attendance(name)
+                    else:
+                        name = "Unknown"
+                        name_txt = f"{name} ({conf:.1f})"
+                        color = (0, 0, 255)
+
+                    # emit detection event
+                    publish({
+                        "type": "detection",
+                        "name": name,
+                        "conf": conf_val,
+                        "yaw": float(yaw),
+                        "pitch": float(pitch),
+                        "box": {"x": X, "y": Y, "w": W, "h": H}
+                    })
                 else:
-                    name = "Unknown"
-                    name_txt = f"{name} ({conf:.1f})"
-                    color = (0, 0, 255)
+                    # non-frontal
+                    publish({
+                        "type": "detection",
+                        "name": "NotFrontal",
+                        "conf": None,
+                        "yaw": float(yaw) if yaw is not None else None,
+                        "pitch": float(pitch) if pitch is not None else None,
+                        "box": {"x": X, "y": Y, "w": W, "h": H}
+                    })
 
-                # emit detection event
-                publish({
-                    "type": "detection",
-                    "name": name,
-                    "conf": conf_val,
-                    "yaw": float(yaw),
-                    "pitch": float(pitch),
-                    "box": {"x": X, "y": Y, "w": W, "h": H}
-                })
-            else:
-                # non-frontal
-                publish({
-                    "type": "detection",
-                    "name": "NotFrontal",
-                    "conf": None,
-                    "yaw": float(yaw) if yaw is not None else None,
-                    "pitch": float(pitch) if pitch is not None else None,
-                    "box": {"x": X, "y": Y, "w": W, "h": H}
-                })
+                # draw overlay
+                cv2.rectangle(frame, (X, Y), (X+W, Y+H), color, 2)
+                cv2.putText(frame, name_txt, (X, Y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # draw overlay
-            cv2.rectangle(frame, (X, Y), (X+W, Y+H), color, 2)
-            cv2.putText(frame, name_txt, (X, Y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        # Encode JPEG (quality ~80 to save CPU/bandwidth)
-        ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ret:
+            # Encode JPEG (quality ~80 to save CPU/bandwidth)
+            ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ret:
+                print("[Camera] Failed to encode frame")
+                continue
+            chunk = buf.tobytes()
+            # Include Content-Length; boundary must match route below
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
+                b"\r\n" + chunk + b"\r\n"
+            )
+        except Exception as e:
+            print(f"[Camera] Error in OpenCV loop: {e}")
+            time.sleep(0.1)
             continue
-        chunk = buf.tobytes()
-        # Include Content-Length; boundary must match route below
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n"
-            b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
-            b"\r\n" + chunk + b"\r\n"
-        )
 
 # ----------------- Upload & retrain helpers -----------------
 def _safe_person_name(name: str) -> str:
@@ -342,20 +508,129 @@ def latest_detection():
 
 @app.route("/test-camera")
 def test_camera():
-    """Simple endpoint to test if camera is accessible"""
+    """Comprehensive camera testing endpoint"""
+    results = {
+        "status": "unknown",
+        "message": "",
+        "picamera2_available": PICAMERA2_AVAILABLE,
+        "available_devices": [],
+        "working_devices": [],
+        "picamera2_status": "not_tested",
+        "errors": [],
+        "system_info": {}
+    }
+    
     try:
-        cap = cv2.VideoCapture(0)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            cap.release()
-            if ret:
-                return jsonify({"status": "success", "message": "Camera is working", "frame_shape": frame.shape})
-            else:
-                return jsonify({"status": "error", "message": "Camera opened but couldn't read frame"}), 500
+        # Check system info
+        import platform
+        results["system_info"]["platform"] = platform.platform()
+        results["system_info"]["python_version"] = platform.python_version()
+        results["system_info"]["opencv_version"] = cv2.__version__
+        
+        # Test picamera2 first (preferred method)
+        if PICAMERA2_AVAILABLE:
+            try:
+                print("[Camera] Testing picamera2...")
+                picam2 = Picamera2()
+                config = picam2.create_preview_configuration(
+                    main={"size": (640, 480), "format": "BGR888"}
+                )
+                picam2.configure(config)
+                picam2.start()
+                time.sleep(1)
+                
+                frame = picam2.capture_array()
+                if frame is not None and frame.size > 0:
+                    results["picamera2_status"] = "working"
+                    results["picamera2_info"] = {
+                        "frame_shape": frame.shape,
+                        "frame_size": frame.size,
+                        "dtype": str(frame.dtype)
+                    }
+                    print("[Camera] picamera2 test successful")
+                else:
+                    results["picamera2_status"] = "no_frame"
+                    results["errors"].append("picamera2: opened but no frame")
+                
+                picam2.stop()
+                picam2.close()
+                
+            except Exception as e:
+                results["picamera2_status"] = "error"
+                results["errors"].append(f"picamera2: {str(e)}")
+                print(f"[Camera] picamera2 test failed: {e}")
+        
+        # List all video devices
+        import glob
+        video_devices = glob.glob("/dev/video*")
+        results["available_devices"] = sorted(video_devices)
+        
+        if not video_devices:
+            results["status"] = "error"
+            results["message"] = "No video devices found in /dev/"
+            results["errors"].append("No /dev/video* devices found")
+            return jsonify(results), 500
+        
+        # Test each OpenCV device
+        for device_path in video_devices:
+            device_num = int(device_path.split('/dev/video')[-1])
+            device_info = {"device": device_path, "number": device_num}
+            
+            try:
+                cap = cv2.VideoCapture(device_num)
+                if cap.isOpened():
+                    # Try to read a frame
+                    ret, frame = cap.read()
+                    if ret and frame is not None and frame.size > 0:
+                        device_info["status"] = "working"
+                        device_info["frame_shape"] = frame.shape
+                        device_info["frame_size"] = frame.size
+                        results["working_devices"].append(device_info)
+                    else:
+                        device_info["status"] = "opened_but_no_frame"
+                        device_info["error"] = "Device opened but couldn't read frame"
+                        results["errors"].append(f"Device {device_num}: opened but no frame")
+                else:
+                    device_info["status"] = "not_accessible"
+                    device_info["error"] = "Device not accessible"
+                    results["errors"].append(f"Device {device_num}: not accessible")
+                
+                cap.release()
+                
+            except Exception as e:
+                device_info["status"] = "error"
+                device_info["error"] = str(e)
+                results["errors"].append(f"Device {device_num}: {str(e)}")
+        
+        # Determine overall status
+        if results["picamera2_status"] == "working":
+            results["status"] = "success"
+            results["message"] = "picamera2 is working (recommended method)"
+        elif results["working_devices"]:
+            results["status"] = "success"
+            results["message"] = f"Found {len(results['working_devices'])} working OpenCV camera(s)"
         else:
-            return jsonify({"status": "error", "message": "Camera device 0 not accessible"}), 500
+            results["status"] = "error"
+            results["message"] = "No working cameras found"
+            
+        # Add troubleshooting tips
+        if results["status"] == "error":
+            results["troubleshooting"] = [
+                "1. Enable camera in raspi-config: sudo raspi-config",
+                "2. Add user to video group: sudo usermod -a -G video $USER",
+                "3. Install picamera2: sudo apt install python3-picamera2",
+                "4. Reboot: sudo reboot",
+                "5. Check camera connection and cables",
+                "6. Ensure no other app is using the camera"
+            ]
+        
+        return jsonify(results)
+        
     except Exception as e:
-        return jsonify({"status": "error", "message": f"Camera error: {str(e)}"}), 500
+        results["status"] = "error"
+        results["message"] = f"Camera test failed: {str(e)}"
+        results["errors"].append(str(e))
+        return jsonify(results), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, threaded=True)

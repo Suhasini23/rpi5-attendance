@@ -1,3 +1,6 @@
-opencv-contrib-python
-flask
-numpy
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+numpy>=1.19.0
+Flask>=2.0.0
+Werkzeug>=2.0.0
+picamera2>=0.3.12
