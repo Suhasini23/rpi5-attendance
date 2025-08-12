@@ -110,7 +110,7 @@ def gen_frames():
     return gen_frames_opencv()
 
 def gen_frames_picamera2():
-    """Generate frames using Picamera2 (CSI camera on Pi 5)."""
+    """Generate frames using Picamera2 (CSI camera on Pi 5) with improved color correction."""
     picam2 = None
     try:
         picam2 = Picamera2()
@@ -121,20 +121,31 @@ def gen_frames_picamera2():
         )
         picam2.configure(config)
 
-        # Set better color controls to fix the bluish tint
+        # Improved color controls to fix the bluish tint
         try:
             picam2.set_controls({
                 "AwbEnable": True,
                 "AeEnable": True,
-                "AwbMode": 0,  # 0=Auto white balance
+                "AwbMode": 1,  # Try mode 1 (tungsten) instead of 0 (auto)
                 "AeExposureMode": 0,  # 0=Normal exposure
                 "AeMeteringMode": 0,  # 0=Centre weighted
+                "ColourGains": (1.4, 1.8),  # (red_gain, blue_gain) - increase red, reduce blue
+                "Brightness": 0.1,  # Slight brightness boost
+                "Contrast": 1.2,    # Slight contrast boost
             })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Camera] Could not set advanced controls: {e}")
+            # Fallback to basic controls
+            try:
+                picam2.set_controls({
+                    "AwbEnable": True,
+                    "AwbMode": 1,  # Tungsten mode often fixes blue tint
+                })
+            except Exception:
+                pass
 
         picam2.start()
-        print("[Camera] Picamera2 started (RGB888)")
+        print("[Camera] Picamera2 started (RGB888) with improved color correction")
         time.sleep(3)  # longer warm-up for AWB/AE to settle
 
         while True:
@@ -144,22 +155,37 @@ def gen_frames_picamera2():
                 time.sleep(0.01)
                 continue
                 
-            # Fix color balance - convert RGB to BGR with proper color correction
+            # Convert RGB to BGR for OpenCV
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             
-            # Apply aggressive color correction to eliminate bluish tint
-            # Increase brightness and contrast first
-            frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=20)
+            # More refined color correction approach
+            # Method 1: LAB color space correction (often most effective)
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
             
-            # Strong color temperature adjustment to eliminate blue/purple cast
-            b, g, r = cv2.split(frame)
-            r = cv2.add(r, 30)  # Significantly increase red channel
-            g = cv2.add(g, 15)  # Increase green channel
-            b = cv2.subtract(b, 25)  # Significantly reduce blue channel
-            frame = cv2.merge([b, g, r])
+            # Adjust the 'a' and 'b' channels to reduce blue/purple cast
+            # 'a' channel: green-red axis, 'b' channel: blue-yellow axis
+            a = cv2.add(a, 8)   # Shift slightly toward red
+            b = cv2.subtract(b, 12)  # Shift toward yellow (away from blue)
             
-            # Apply additional color correction to warm up the image
-            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=0)
+            lab_corrected = cv2.merge([l, a, b])
+            frame = cv2.cvtColor(lab_corrected, cv2.COLOR_LAB2BGR)
+            
+            # Method 2: Additional RGB channel adjustment (lighter touch)
+            b_channel, g_channel, r_channel = cv2.split(frame)
+            
+            # More subtle channel adjustments
+            r_channel = cv2.add(r_channel, 15)  # Boost red slightly
+            g_channel = cv2.add(g_channel, 5)   # Slight green boost
+            b_channel = cv2.subtract(b_channel, 10)  # Reduce blue slightly
+            
+            frame = cv2.merge([b_channel, g_channel, r_channel])
+            
+            # Method 3: Gamma correction for better color balance
+            gamma = 1.1  # Slight gamma adjustment
+            inv_gamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            frame = cv2.LUT(frame, table)
 
             # ---- detection + overlay ----
             process_and_emit(frame)
@@ -186,6 +212,7 @@ def gen_frames_picamera2():
                 picam2.close()
             except:
                 pass
+
 
 def gen_frames_opencv():
     """Fallback using OpenCV V4L2 (for USB UVC cameras)."""
