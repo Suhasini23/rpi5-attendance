@@ -191,8 +191,23 @@ def gen_frames_picamera2():
             
             # Handle different formats with proper color conversion
             if camera_format == 'RGB888':
-                # Convert RGB to BGR for OpenCV - this preserves correct colors
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # For RGB888, we need to handle the color conversion carefully
+                # The purple output suggests the conversion isn't working right
+                try:
+                    # Try direct RGB to BGR conversion
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                except:
+                    # If that fails, try manual channel swapping
+                    frame = frame[:, :, ::-1]  # Reverse channels: RGB -> BGR
+                
+                # Apply color correction to fix any remaining tint
+                b, g, r = cv2.split(frame)
+                # Boost red and green, reduce blue to fix purple tint
+                r = cv2.add(r, 20)
+                g = cv2.add(g, 10)
+                b = cv2.subtract(b, 15)
+                frame = cv2.merge([b, g, r])
+                
             elif camera_format == 'BGR888':
                 # Already in BGR format, no conversion needed
                 pass
