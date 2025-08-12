@@ -124,10 +124,10 @@ def gen_frames_picamera2():
             main={"size": (640, 480), "format": "BGR888"},
             controls={
                 "FrameDurationLimits": (33333, 33333),  # 30 FPS
-                "AeEnable": True,  # Auto exposure
-                "AwbEnable": True,  # Auto white balance
-                "AeExposureMode": "Normal",
-                "AwbMode": "Auto"
+                "AeEnable": 1,  # Auto exposure (1 = True, 0 = False)
+                "AwbEnable": 1,  # Auto white balance (1 = True, 0 = False)
+                "AeExposureMode": 0,  # Normal exposure mode
+                "AwbMode": 0  # Auto white balance mode
             }
         )
         picam2.configure(config)
@@ -141,8 +141,8 @@ def gen_frames_picamera2():
         
         # Try to set better color balance
         try:
-            picam2.set_controls({"AwbMode": "Auto"})
-            picam2.set_controls({"AeEnable": True})
+            picam2.set_controls({"AwbMode": 0})
+            picam2.set_controls({"AeEnable": 1})
         except:
             pass  # Some controls might not be available
         
