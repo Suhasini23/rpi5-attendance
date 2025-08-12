@@ -100,21 +100,21 @@ deb = Debounce(cooldown_sec=120)
 def gen_frames():
     # Try different camera devices - modern Pi models often use different device numbers
     camera_devices = [0, 1, 2, 3, 4, 5, 6, 7, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
-    
+
     cap = None
     for device in camera_devices:
-        try:
-            cap = cv2.VideoCapture(device)
-            if cap.isOpened():
-                print(f"[Camera] Successfully opened camera device {device}")
+        cap = cv2.VideoCapture(device)
+        if cap.isOpened():
+            time.sleep(0.2)  # warm up
+            ok, _ = cap.read()
+            if ok:
+                print(f"[Camera] Using device {device}")
                 break
-            else:
-                cap.release()
-        except Exception as e:
-            print(f"[Camera] Failed to open device {device}: {e}")
-            if cap:
-                cap.release()
-    
+            cap.release()
+            cap = None
+        else:
+            cap.release()
+
     if not cap or not cap.isOpened():
         raise RuntimeError("No camera available on any device")
 
@@ -187,10 +187,18 @@ def gen_frames():
             cv2.rectangle(frame, (X, Y), (X+W, Y+H), color, 2)
             cv2.putText(frame, name_txt, (X, Y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        ret, buf = cv2.imencode(".jpg", frame)
+        # Encode JPEG (quality ~80 to save CPU/bandwidth)
+        ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if not ret:
             continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+        chunk = buf.tobytes()
+        # Include Content-Length; boundary must match route below
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(chunk)).encode() + b"\r\n"
+            b"\r\n" + chunk + b"\r\n"
+        )
 
 # ----------------- Upload & retrain helpers -----------------
 def _safe_person_name(name: str) -> str:
@@ -277,7 +285,17 @@ def _retrain_lbph_from_disk():
 # ----------------- Routes -----------------
 @app.route("/video")
 def video():
-    return Response(gen_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "X-Accel-Buffering": "no",  # disable proxy buffering if behind nginx
+    }
+    return Response(
+        gen_frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers=headers,
+        direct_passthrough=True,
+    )
 
 @app.route("/events")
 def events():
