@@ -1,4 +1,8 @@
-import os, json, time, sqlite3, re
+import os
+import json
+import time
+import sqlite3
+import re
 import numpy as np
 import cv2
 from queue import Queue
@@ -6,18 +10,23 @@ from threading import Lock
 from flask import Flask, Response, jsonify, request, stream_with_context
 from werkzeug.utils import secure_filename
 
-# Picamera2 availability check (Pi camera path)
-try:
-    from picamera2 import Picamera2
-    PICAMERA2_AVAILABLE = True
-except Exception:
-    PICAMERA2_AVAILABLE = False
-    print("Warning: picamera2 not available, will try OpenCV V4L2 devices.")
+"""
+This runtime module starts a Flask web application that serves video frames,
+performs face detection/recognition, and logs attendance.  It uses a
+CameraManager instance to abstract away the complexities of configuring
+Picamera2 on Raspberry Pi 5 industrial systems (and falls back to OpenCV
+automatically if Picamera2 is unavailable).
 
-from utils.yunet import YuNet, ensure_model
-from utils.align import align_face
-from utils.pose import head_pose_angles
-from utils.debounce import Debounce
+The CameraManager handles pixel format detection, colour-space correction
+and transforms, so we avoid hard-coding a single format (e.g. RGB888) and
+fix the common red/blue swap and purple-tint issues.
+
+To customise the camera settings (resolution, framerate, flips), adjust the
+CameraManager instantiation below.
+"""
+
+# Import our camera manager
+from camera_manager import CameraManager
 
 # Paths / models
 MODEL_IN    = "app/models/lbph_model.yml"
@@ -37,6 +46,21 @@ PROC_W = 320
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # ~5MB uploads
+
+# ----------------- Camera initialisation -----------------
+# Configure the camera.  Adjust width/height/framerate/flip as needed.
+camera_manager = CameraManager(
+    width=640,
+    height=480,
+    framerate=20,
+    camera_port='CSI0',
+    autofocus=False,
+    awb_mode='auto',
+    exposure_mode='auto',
+    horizontal_flip=False,
+    vertical_flip=False,
+    debug=False
+)
 
 # ----------------- Realtime (SSE + snapshot) -----------------
 events_q = Queue(maxsize=200)
@@ -90,83 +114,43 @@ def load_models():
     recognizer.read(MODEL_IN)
     label_map = json.load(open(LABELS_IN))
     inv_labels = {v: k for k, v in label_map.items()}
+    # Ensure the YuNet model exists
+    from utils.yunet import ensure_model
     ensure_model(YUNET_MODEL)
+    # Load YuNet detector
+    from utils.yunet import YuNet
     det = YuNet(YUNET_MODEL, input_size=(PROC_W, PROC_W), conf_threshold=0.6)
     return recognizer, inv_labels, det
 
 recognizer, inv_labels, det = load_models()
 init_db()
+from utils.debounce import Debounce
 deb = Debounce(cooldown_sec=120)
 
 # ----------------- Video loop (MJPEG producer) -----------------
 def gen_frames():
-    # Prefer Picamera2 on Pi; fall back to V4L2 (USB cams)
-    if PICAMERA2_AVAILABLE:
-        try:
-            return gen_frames_picamera2()
-        except Exception as e:
-            print(f"[Camera] Picamera2 path failed: {e}. Falling back to OpenCV V4L2.")
-    return gen_frames_opencv()
-
-def gen_frames_picamera2():
-    """Picamera2 path with correct colors on Pi5 industrial shield:
-    - Request uncompressed RAW (SGRBG10) to avoid purple/blacked-out shadows:contentReference[oaicite:2]{index=2}.
-    - Capture in RGB888 and convert to BGR for OpenCV/JPEG:contentReference[oaicite:3]{index=3}.
-    - Leave AWB/AE enabled.
     """
-    picam2 = None
-    try:
-        from picamera2 import Picamera2
-        # Some features (Transform) live in libcamera; import only if available
+    Generator that yields JPEG frames for the MJPEG stream.  Frames are
+    captured using the CameraManager and passed through the detection
+    pipeline.  Colour conversion is handled inside CameraManager, so no
+    additional conversion is necessary here.
+    """
+    # Ensure the camera is initialised (will do nothing if already done)
+    if not camera_manager.is_initialized:
+        camera_manager.initialize()
+
+    while True:
+        frame = camera_manager.read_frame()
+        if frame is None:
+            # If no frame is captured, wait a bit and try again
+            time.sleep(0.01)
+            continue
+
+        # ---- detection + overlay ----
+        process_and_emit(frame)
+
+        # MJPEG encode & yield
         try:
-            from libcamera import Transform
-        except Exception:
-            Transform = None
-
-        picam2 = Picamera2()
-
-        # Configure preview or video stream; request uncompressed raw to avoid colour artefacts
-        cfg = picam2.create_preview_configuration(
-            main={"size": (640, 480), "format": "RGB888"},
-            raw={'format': 'SGRBG10'}  # uncompressed to avoid Pi5/v1 compression bug
-        )
-        picam2.configure(cfg)
-
-        # Keep auto exposure/white-balance running; don't lock gains
-        try:
-            picam2.set_controls({
-                "AeEnable": True,
-                "AwbEnable": True,
-                "AwbMode": 0,        # Auto
-                "AeFlickerMode": 1,  # 50Hz anti-flicker (optional)
-            })
-        except Exception as e:
-            print(f"[Camera] Some controls not applied: {e}")
-
-        picam2.start()
-        print("[Camera] Picamera2 started (RGB888→BGR, raw SGRBG10)")
-        time.sleep(2.0)  # let AWB/AE settle
-
-        while True:
-            # Capture an array; Picamera2 returns RGB frames even if you ask for BGR
-            frame = picam2.capture_array()
-            if frame is None or frame.size == 0:
-                time.sleep(0.01)
-                continue
-
-            # Convert to BGR for OpenCV: drop alpha if present, swap channels
-            try:
-                if frame.ndim == 3:
-                    if frame.shape[2] == 4:
-                        frame = frame[:, :, :3]  # drop alpha
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                print(f"[Camera] Color convert error: {e}")
-
-            # ---- detection + overlay ----
-            process_and_emit(frame)
-
-            # MJPEG encode & yield
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if not ok:
                 continue
@@ -177,55 +161,9 @@ def gen_frames_picamera2():
                 b"Content-Length: " + str(len(chunk)).encode() + b"\r\n\r\n"
                 + chunk + b"\r\n"
             )
-
-    except Exception as e:
-        print(f"[Camera] Picamera2 error: {e}")
-        raise
-    finally:
-        if picam2:
-            try:
-                picam2.stop()
-                picam2.close()
-            except Exception:
-                pass
-
-def gen_frames_opencv():
-    """Fallback using OpenCV V4L2 (for USB UVC cameras)."""
-    camera_devices = [0, 1, 2, 3, 4, 5, 6]
-    cap = None
-    for device in camera_devices:
-        cap_try = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        if cap_try.isOpened():
-            time.sleep(0.2)
-            ok, _ = cap_try.read()
-            if ok:
-                cap = cap_try
-                print(f"[Camera] Using V4L2 device {device}")
-                break
-        cap_try.release()
-    if cap is None:
-        raise RuntimeError("No V4L2 camera found and Picamera2 unavailable.")
-
-    while True:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            time.sleep(0.01)
+        except Exception:
+            # On encoding error, skip frame
             continue
-
-        # ---- detection + overlay ----
-        process_and_emit(frame)
-
-        # MJPEG chunk
-        ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ret:
-            continue
-        chunk = buf.tobytes()
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n"
-            b"Content-Length: " + str(len(chunk)).encode() + b"\r\n\r\n"
-            + chunk + b"\r\n"
-        )
 
 # ----------------- Vision pipeline -----------------
 def process_and_emit(frame):
@@ -308,7 +246,7 @@ def _save_uploaded_images(person_name: str, files):
         saved.append(out_path)
     return saved
 
-def _detect_align_for_training(det_local: YuNet, img_bgr):
+def _detect_align_for_training(det_local: Any, img_bgr):
     dets = det_local.detect(img_bgr)
     if not dets:
         return None
@@ -319,7 +257,10 @@ def _detect_align_for_training(det_local: YuNet, img_bgr):
     return align_face(roi, pts5, out_size=100)
 
 def _retrain_lbph_from_disk():
+    # Ensure model exists
+    from utils.yunet import ensure_model
     ensure_model(YUNET_MODEL)
+    from utils.yunet import YuNet
     det_local = YuNet(YUNET_MODEL, input_size=(PROC_W, PROC_W), conf_threshold=0.6)
 
     faces, labels = [], []
@@ -418,4 +359,6 @@ def latest_detection():
         return jsonify(latest)
 
 if __name__ == "__main__":
+    # Optionally pre-initialize the camera here
+    # camera_manager.initialize()
     app.run(host="0.0.0.0", port=5000, threaded=True)
