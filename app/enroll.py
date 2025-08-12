@@ -9,7 +9,7 @@ LABELS_OUT = "app/models/label_map.json"
 YUNET_MODEL= "app/models/yunet.onnx"
 
 PROC_W = 320          # must match runtime
-DET_CONF = 0.5        # a bit looser than 0.6 for training
+DET_CONF = 0.6        # match runtime confidence threshold
 
 def iter_person_images():
     for person in sorted(os.listdir(DATA_DIR)):
@@ -24,12 +24,15 @@ def best_detection(det, img_bgr):
     candidates = []
     rotations = [0, 90, 270]  # try upright, left, right
     sizes = [PROC_W, 480, 640]
+    
+    print(f"  Trying detection with {len(rotations)} rotations and {len(sizes)} sizes...")
+    
     for rot in rotations:
         if rot == 0:
             base = img_bgr
         elif rot == 90:
             base = cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
-        else:
+        elif rot == 270:
             base = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         h0, w0 = base.shape[:2]
@@ -37,14 +40,22 @@ def best_detection(det, img_bgr):
             scale = W / float(w0)
             small = cv2.resize(base, (W, int(h0*scale)))
             dets = det.detect(small)
-            if not dets: continue
+            if not dets: 
+                print(f"    Rotation {rot}°, size {W}: No detections")
+                continue
             dets.sort(key=lambda d: d[2], reverse=True)
             (x,y,w,h), lmk, score = dets[0]
+            print(f"    Rotation {rot}°, size {W}: Found face with score {score:.3f}")
             candidates.append(((x,y,w,h), lmk, score, small))
+    
     if not candidates:
+        print("  No faces detected in any rotation/size combination")
         return None
+    
     # choose highest score
-    return max(candidates, key=lambda c: c[2])
+    best = max(candidates, key=lambda c: c[2])
+    print(f"  Best detection: score {best[2]:.3f}")
+    return best
 
 if __name__ == "__main__":
     ensure_model(YUNET_MODEL)
@@ -54,6 +65,7 @@ if __name__ == "__main__":
     label_map, next_id = {}, 0
 
     for person, path in iter_person_images():
+        print(f"\nProcessing: {path}")
         img = cv2.imread(path)
         if img is None:
             print(f"Skip unreadable: {path}")
@@ -82,6 +94,7 @@ if __name__ == "__main__":
             label_map[person] = next_id; next_id += 1
         faces.append(aligned)
         labels.append(label_map[person])
+        print(f"Successfully processed face {len(faces)} for {person}")
 
     if not faces:
         raise SystemExit("No faces found to train.")
@@ -93,4 +106,6 @@ if __name__ == "__main__":
     with open(LABELS_OUT, "w") as f:
         json.dump(label_map, f, indent=2)
 
-    print(f"Trained LBPH on {len(faces)} samples across {len(label_map)} people.")
+    print(f"\nTrained LBPH on {len(faces)} samples across {len(label_map)} people.")
+    print(f"Model saved to: {MODEL_OUT}")
+    print(f"Labels saved to: {LABELS_OUT}")
